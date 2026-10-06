@@ -1,12 +1,16 @@
 // Package petbattle 把宠物对战请求分片配对。
 package petbattle
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // 排队参数。
 const (
 	Shards           = 4
 	BaseThreshold    = 10
+	RelaxedThreshold = 20
 	TimeoutMS        = 1000
 	MaxPairsPerShard = 3
 )
@@ -53,15 +57,33 @@ func ShardOf(id string) int {
 	return sum % Shards
 }
 
-// Enqueue 把请求放进队列。
+// Enqueue 把请求放进队列；同一个 req_id 只入队一次。
 func Enqueue(queue []Request, req Request) []Request {
+	if req.ReqID != "" {
+		for _, q := range queue {
+			if q.ReqID == req.ReqID {
+				return queue
+			}
+		}
+	}
 	return append(queue, req)
+}
+
+// thresholdFor 返回这一对的评分差阈值：任一方等待达到超时线就放宽。
+func thresholdFor(a, b Request) int {
+	if a.WaitMS >= TimeoutMS || b.WaitMS >= TimeoutMS {
+		return RelaxedThreshold
+	}
+	return BaseThreshold
 }
 
 func pairShard(reqs []Request, c *Counter) []Pair {
 	var pairs []Pair
 	used := make([]bool, len(reqs))
 	for i := range reqs {
+		if len(pairs) >= MaxPairsPerShard {
+			break
+		}
 		if used[i] {
 			continue
 		}
@@ -71,7 +93,7 @@ func pairShard(reqs []Request, c *Counter) []Pair {
 			if j == i || used[j] {
 				continue
 			}
-			if abs(reqs[i].Score-reqs[j].Score) <= BaseThreshold {
+			if abs(reqs[i].Score-reqs[j].Score) <= thresholdFor(reqs[i], reqs[j]) {
 				if best == -1 || reqs[j].ID < reqs[best].ID {
 					best = j
 				}
@@ -110,5 +132,6 @@ func Match(queue []Request, c *Counter) Result {
 		pairs = append(pairs, results[s]...)
 		c.Scanned += counters[s].Scanned
 	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].A < pairs[j].A })
 	return Result{Pairs: pairs, Queued: len(queue), Scanned: c.Scanned}
 }
