@@ -1,12 +1,16 @@
 // Package petbattle 把宠物对战请求分片配对。
 package petbattle
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // 排队参数。
 const (
 	Shards           = 4
 	BaseThreshold    = 10
+	RelaxedThreshold = 20
 	TimeoutMS        = 1000
 	MaxPairsPerShard = 3
 )
@@ -53,33 +57,99 @@ func ShardOf(id string) int {
 	return sum % Shards
 }
 
-// Enqueue 把请求放进队列。
+// Enqueue 把请求放进队列；同一个 req_id 只入队一次。
 func Enqueue(queue []Request, req Request) []Request {
+	if req.ReqID != "" {
+		for _, q := range queue {
+			if q.ReqID == req.ReqID {
+				return queue
+			}
+		}
+	}
 	return append(queue, req)
 }
 
+// canPair 判断两条请求能否配对：分差不超过 10；
+// 任一方等待达到超时线时，阈值放宽到 20。
+func canPair(a, b Request) bool {
+	threshold := BaseThreshold
+	if a.WaitMS >= TimeoutMS || b.WaitMS >= TimeoutMS {
+		threshold = RelaxedThreshold
+	}
+	return abs(a.Score-b.Score) <= threshold
+}
+
+type entry struct {
+	req  Request
+	used bool
+}
+
+// pairShard 在单个分片内配对，最多配 MaxPairsPerShard 对。
+// 按评分分桶，只比较阈值可达的桶，避免随队列长度平方级扫描。
 func pairShard(reqs []Request, c *Counter) []Pair {
-	var pairs []Pair
-	used := make([]bool, len(reqs))
-	for i := range reqs {
-		if used[i] {
-			continue
+	byScore := make(map[int][]*entry)
+	var scores []int
+	for _, req := range reqs {
+		if _, ok := byScore[req.Score]; !ok {
+			scores = append(scores, req.Score)
 		}
-		best := -1
-		for j := range reqs {
-			c.Scanned++
-			if j == i || used[j] {
+		e := &entry{req: req}
+		byScore[req.Score] = append(byScore[req.Score], e)
+	}
+	sort.Ints(scores)
+	for _, s := range scores {
+		bucket := byScore[s]
+		sort.Slice(bucket, func(i, j int) bool { return bucket[i].req.ID < bucket[j].req.ID })
+	}
+
+	var pairs []Pair
+	for _, s := range scores {
+		bucket := byScore[s]
+		for _, e := range bucket {
+			if len(pairs) >= MaxPairsPerShard {
+				return pairs
+			}
+			if e.used {
 				continue
 			}
-			if abs(reqs[i].Score-reqs[j].Score) <= BaseThreshold {
-				if best == -1 || reqs[j].ID < reqs[best].ID {
-					best = j
+			var best *entry
+			// 先找评分更低、id 最小的候选。
+			for _, ls := range scores {
+				if ls >= s {
+					break
+				}
+				if s-ls > RelaxedThreshold {
+					continue
+				}
+				for _, cand := range byScore[ls] {
+					c.Scanned++
+					if cand.used || !canPair(e.req, cand.req) {
+						continue
+					}
+					if best == nil || cand.req.ID < best.req.ID {
+						best = cand
+					}
+					break
 				}
 			}
-		}
-		if best >= 0 {
-			used[i], used[best] = true, true
-			pairs = append(pairs, Pair{A: reqs[i].ID, B: reqs[best].ID})
+			// 再在同分桶内找 id 更大的候选。
+			for _, cand := range bucket {
+				if cand.req.ID <= e.req.ID {
+					continue
+				}
+				c.Scanned++
+				if cand.used || !canPair(e.req, cand.req) {
+					continue
+				}
+				if best == nil || cand.req.ID < best.req.ID {
+					best = cand
+				}
+				break
+			}
+			if best != nil {
+				e.used, best.used = true, true
+				pairs = append(pairs, Pair{A: e.req.ID, B: best.req.ID})
+			}
 		}
 	}
 	return pairs
@@ -110,5 +180,6 @@ func Match(queue []Request, c *Counter) Result {
 		pairs = append(pairs, results[s]...)
 		c.Scanned += counters[s].Scanned
 	}
-	return Result{Pairs: pairs, Queued: len(queue), Scanned: c.Scanned}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].A < pairs[j].A })
+	return Result{Pairs: pairs, Queued: len(queue) - 2*len(pairs), Scanned: c.Scanned}
 }
